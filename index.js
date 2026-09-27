@@ -243,6 +243,12 @@ function saveCache() {
 let indexState = {
   initialScanComplete: false,
   recentAudioMessageIds: [],
+  fullScanResume: {
+    musicOffsetId: 0,
+    documentsOffsetId: 0,
+    musicComplete: false,
+    documentsComplete: false,
+  },
 };
 
 function loadIndexState() {
@@ -251,13 +257,29 @@ function loadIndexState() {
     const data = JSON.parse(fs.readFileSync(INDEX_STATE_FILE, 'utf-8'));
     if (!data || typeof data !== 'object') return;
     indexState.initialScanComplete = data.initialScanComplete === true;
+    const resume = data.fullScanResume;
+    if (resume && typeof resume === 'object') {
+      indexState.fullScanResume = {
+        musicOffsetId: Number(resume.musicOffsetId) || 0,
+        documentsOffsetId: Number(resume.documentsOffsetId) || 0,
+        musicComplete: resume.musicComplete === true,
+        documentsComplete: resume.documentsComplete === true,
+      };
+    }
     if (Array.isArray(data.recentAudioMessageIds)) {
       indexState.recentAudioMessageIds = data.recentAudioMessageIds
         .map((id) => String(id))
         .filter((id) => /^\d+$/.test(id))
         .slice(0, INDEX_CHECKPOINT_COUNT);
     }
-    console.log(`[IndexState] Loaded checkpoint: complete=${indexState.initialScanComplete}, overlap IDs=${indexState.recentAudioMessageIds.join(', ') || 'none'}`);
+    console.log(
+      '[IndexState] Loaded checkpoint: complete=' + indexState.initialScanComplete +
+      ', musicOffset=' + indexState.fullScanResume.musicOffsetId +
+      ', documentsOffset=' + indexState.fullScanResume.documentsOffsetId +
+      ', musicComplete=' + indexState.fullScanResume.musicComplete +
+      ', documentsComplete=' + indexState.fullScanResume.documentsComplete +
+      ', overlap IDs=' + (indexState.recentAudioMessageIds.join(', ') || 'none')
+    );
   } catch (err) {
     console.warn(`[IndexState] Could not load checkpoint: ${err.message}`);
   }
@@ -1276,48 +1298,90 @@ async function buildTrackIndex({ forceFull = false } = {}) {
   fastStartCache.clear();
 
   try {
+    if (forceFull) {
+      indexState.initialScanComplete = false;
+      indexState.fullScanResume = {
+        musicOffsetId: 0,
+        documentsOffsetId: 0,
+        musicComplete: false,
+        documentsComplete: false,
+      };
+      saveIndexState();
+    }
+
     const isIncremental =
       !forceFull &&
       indexState.initialScanComplete &&
       trackIndex.length > 0 &&
       getIncrementalMinId() > 0;
 
-    const scanMinId = isIncremental ? getIncrementalMinId() : 0;
     const seenIds = new Set();
     const existingById = new Map(trackIndex.map((t) => [String(t.id), t]));
     const newlyParsed = [];
     let scanned = 0;
     let audioCandidates = 0;
+    let checkpointMessageCount = 0;
     const scanCheckpointIds = [...indexState.recentAudioMessageIds];
 
     if (isIncremental) {
-      console.log(`[Library] Incremental scan active. Checking audio messages newer than checkpoint window (min ID: ${scanMinId}).`);
+      console.log('[Library] Incremental scan active. Checking messages newer than the 3-audio-message checkpoint overlap.');
     } else {
-      console.log('[Library] Full history scan active. This is required when no completed checkpoint exists.');
+      console.log('[Library] Full history scan/resume active. Progress is checkpointed during traversal.');
     }
 
     const filters = [
-      { name: 'music', filter: Api.InputMessagesFilterMusic },
-      { name: 'documents', filter: Api.InputMessagesFilterDocument },
+      { name: 'music', filter: Api.InputMessagesFilterMusic, stateKey: 'musicOffsetId', completeKey: 'musicComplete' },
+      { name: 'documents', filter: Api.InputMessagesFilterDocument, stateKey: 'documentsOffsetId', completeKey: 'documentsComplete' },
     ];
 
     for (const filterInfo of filters) {
-      console.log(`[Library] Scanning Telegram ${filterInfo.name} ${isIncremental ? 'incremental' : 'history'}...`);
+      if (!isIncremental && indexState.fullScanResume[filterInfo.completeKey]) {
+        console.log('[Library] ' + filterInfo.name + ' history already checkpointed as complete; skipping.');
+        continue;
+      }
 
-      for await (const msg of client.iterMessages(channelEntity, {
+      const resumeOffset = isIncremental
+        ? 0
+        : Number(indexState.fullScanResume[filterInfo.stateKey]) || 0;
+
+      console.log(
+        '[Library] Scanning Telegram ' + filterInfo.name + ' ' +
+        (isIncremental
+          ? 'incremental...'
+          : (resumeOffset > 0 ? 'resuming before message ID ' + resumeOffset + '...' : 'history from newest...'))
+      );
+
+      const iterOptions = {
         limit: 0,
         waitTime: 1,
         filter: filterInfo.filter,
-        ...(isIncremental ? { minId: scanMinId } : {}),
-      })) {
+      };
+
+      if (isIncremental) {
+        Object.assign(iterOptions, { minId: getIncrementalMinId() });
+      } else if (resumeOffset > 0) {
+        // iterMessages traverses newest -> oldest by default.
+        // offsetId resumes strictly before the last successfully checkpointed message.
+        Object.assign(iterOptions, { offsetId: resumeOffset });
+      }
+
+      for await (const msg of client.iterMessages(channelEntity, iterOptions)) {
         scanned++;
+        checkpointMessageCount++;
 
         const msgIdStr = String(msg.id);
         if (seenIds.has(msgIdStr)) continue;
         seenIds.add(msgIdStr);
 
         const doc = msg.media?.document;
-        if (!doc || !isAudioDocument(doc)) continue;
+        if (!doc || !isAudioDocument(doc)) {
+          if (!isIncremental && checkpointMessageCount % 100 === 0) {
+            indexState.fullScanResume[filterInfo.stateKey] = Number(msg.id) || 0;
+            saveCache();
+            saveIndexState();
+          }
+          continue;
+        }
 
         audioCandidates++;
         rememberAudioMessageId(msg.id);
@@ -1337,8 +1401,22 @@ async function buildTrackIndex({ forceFull = false } = {}) {
         }
 
         if (audioCandidates % 100 === 0) {
-          console.log(`[Library] ${isIncremental ? 'Checked' : 'Indexed'} ${audioCandidates} audio files so far...`);
+          console.log('[Library] ' + (isIncremental ? 'Checked ' : 'Indexed ') + audioCandidates + ' audio files so far...');
         }
+
+        // Persist metadata plus the exact Telegram traversal position.
+        if (!isIncremental && (audioCandidates % 100 === 0 || checkpointMessageCount % 100 === 0)) {
+          indexState.fullScanResume[filterInfo.stateKey] = Number(msg.id) || 0;
+          saveCache();
+          saveIndexState();
+          console.log('[IndexState] Checkpoint saved: ' + filterInfo.name + ' at message ID ' + msg.id);
+        }
+      }
+
+      if (!isIncremental) {
+        indexState.fullScanResume[filterInfo.completeKey] = true;
+        saveIndexState();
+        console.log('[IndexState] ' + filterInfo.name + ' history scan checkpoint marked complete.');
       }
     }
 
@@ -1356,34 +1434,46 @@ async function buildTrackIndex({ forceFull = false } = {}) {
         .slice(0, INDEX_CHECKPOINT_COUNT);
       saveIndexState();
 
-      console.log(`[Library] Incremental scan complete: ${scanned} messages checked, ${audioCandidates} audio candidates, ${newlyParsed.length} new tracks processed, ${trackIndex.length} tracks in library.`);
+      console.log('[Library] Incremental scan complete: ' + scanned + ' messages checked, ' +
+        audioCandidates + ' audio candidates, ' + newlyParsed.length + ' new tracks processed, ' +
+        trackIndex.length + ' tracks in library.');
     } else {
       for (const parsed of newlyParsed) {
-        trackIndex.push(parsed);
+        if (!trackIndex.some((t) => String(t.id) === String(parsed.id))) {
+          trackIndex.push(parsed);
+        }
       }
 
       updateMediaCacheCapacity();
       lastIndexed = Date.now();
       saveCache();
 
-      console.log(`[Library] History scan complete: ${scanned} matching messages, ${audioCandidates} audio candidates, ${trackIndex.length} tracks indexed.`);
+      console.log('[Library] History scan/resume complete: ' + scanned + ' messages checked, ' +
+        audioCandidates + ' audio candidates, ' + trackIndex.length + ' tracks indexed.');
       await deduplicateEntireLibrary();
 
       indexState.initialScanComplete = true;
       indexState.recentAudioMessageIds = [...new Set(scanCheckpointIds.map(String))]
         .sort((a, b) => Number(b) - Number(a))
         .slice(0, INDEX_CHECKPOINT_COUNT);
+      indexState.fullScanResume = {
+        musicOffsetId: 0,
+        documentsOffsetId: 0,
+        musicComplete: true,
+        documentsComplete: true,
+      };
       saveIndexState();
 
-      console.log(`[IndexState] Initial checkpoint saved. Future restarts will check only after the last ${INDEX_CHECKPOINT_COUNT} audio message IDs.`);
+      console.log('[IndexState] Initial checkpoint finalized. Future restarts will scan only newer messages using the last ' +
+        INDEX_CHECKPOINT_COUNT + ' audio IDs as overlap.');
     }
   } catch (err) {
     console.error('[Library] Error during track indexing:', err.stack || err.message);
+    if (!indexState.initialScanComplete) saveIndexState();
   } finally {
     isIndexing = false;
   }
 }
-
 function findTrack(id) {
   return trackIndex.find((t) => t.id === id);
 }
@@ -2624,18 +2714,32 @@ async function startBotCallbackPoller(botToken) {
     // Start 30-minute digest and 12-hour auto-deletion interval checker (checks every 5 minutes)
     setInterval(checkDigestSchedule, 5 * 60 * 1000);
 
-    // Telegram connection watchdog: keeps client alive and restarts if disconnected
-    setInterval(async () => {
-      try {
-        if (!client.connected) {
+    // Telegram connection watchdog: avoid overlapping reconnect attempts.
+    let reconnectPromise = null;
+    const ensureTelegramConnected = async () => {
+      if (client.connected) return true;
+      if (reconnectPromise) return reconnectPromise;
+
+      reconnectPromise = (async () => {
+        try {
           console.warn('[Watchdog] MTProto disconnected. Reconnecting...');
           await client.connect();
           console.log('[Watchdog] MTProto reconnected successfully.');
+          return true;
+        } catch (err) {
+          console.warn('[Watchdog] Reconnect failed:', err.message);
+          return false;
+        } finally {
+          reconnectPromise = null;
         }
-      } catch (err) {
-        console.warn('[Watchdog] Reconnect failed:', err.message);
-      }
-    }, 15000);
+      })();
+
+      return reconnectPromise;
+    };
+
+    setInterval(() => {
+      ensureTelegramConnected().catch(() => {});
+    }, 30000);
 
     app.listen(PORT, '0.0.0.0', async () => {
       console.log(`BitChord Addon server running on http://0.0.0.0:${PORT}`);
