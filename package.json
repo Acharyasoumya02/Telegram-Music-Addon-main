@@ -5,11 +5,11 @@
   "main": "index.js",
   "type": "commonjs",
   "engines": {
-    "node": ">=18.0.0"
+    "node": "22.23.1"
   },
   "scripts": {
     "login": "node login.js",
-    "start": "node --max-old-space-size=128 index.js"
+    "start": "node --max-old-space-size=256 index.js"
   },
   "dependencies": {
     "big-integer": "^1.6.52",
