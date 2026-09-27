@@ -1226,43 +1226,89 @@ async function buildTrackIndex() {
   if (isIndexing) return;
   isIndexing = true;
   fastStartCache.clear();
+
   try {
     const newIndex = [];
     const seenIds = new Set();
-    let batchCount = 0;
+    let scanned = 0;
+    let audioCandidates = 0;
 
-    for await (const msg of client.iterMessages(channelEntity, { limit: 5000, waitTime: 0 })) {
+    // Use Telegram's server-side music filter so the full music history
+    // can be paginated efficiently even when the channel has many messages.
+    const musicMessages = client.iterMessages(channelEntity, {
+      limit: undefined,
+      waitTime: 1,
+      filter: Api.InputMessagesFilterMusic,
+    });
+
+    for await (const msg of musicMessages) {
+      scanned++;
       const msgIdStr = String(msg.id);
       if (seenIds.has(msgIdStr)) continue;
       seenIds.add(msgIdStr);
 
       const doc = msg.media?.document;
-      if (!doc || !isAudioDocument(doc)) {
-        continue;
-      }
+      if (!doc || !isAudioDocument(doc)) continue;
 
+      audioCandidates++;
       mediaCache.set(msgIdStr, msg.media);
 
-      const existing = trackIndex.find((t) => t.id === msgIdStr);
+      const existing = trackIndex.find((t) => String(t.id) === msgIdStr);
       if (existing) {
-        if (!existing.sizeBytes && doc.size) {
-          existing.sizeBytes = Number(doc.size);
-        }
+        if (!existing.sizeBytes && doc.size) existing.sizeBytes = Number(doc.size);
         newIndex.push(existing);
       } else {
         const parsed = await parseTrackMessage(msg);
-        if (parsed) {
-          newIndex.push(parsed);
-        }
+        if (parsed) newIndex.push(parsed);
       }
 
-      batchCount++;
+      if (audioCandidates % 100 === 0) {
+        console.log(`[Library] Indexed ${audioCandidates} audio files so far...`);
+      }
+    }
+
+    // Fallback for audio files Telegram classifies as generic documents.
+    if (audioCandidates === 0) {
+      console.warn('[Library] Music filter returned 0 files. Falling back to document history scan...');
+      const documentMessages = client.iterMessages(channelEntity, {
+        limit: undefined,
+        waitTime: 1,
+        filter: Api.InputMessagesFilterDocument,
+      });
+
+      for await (const msg of documentMessages) {
+        scanned++;
+        const msgIdStr = String(msg.id);
+        if (seenIds.has(msgIdStr)) continue;
+        seenIds.add(msgIdStr);
+
+        const doc = msg.media?.document;
+        if (!doc || !isAudioDocument(doc)) continue;
+
+        audioCandidates++;
+        mediaCache.set(msgIdStr, msg.media);
+
+        const existing = trackIndex.find((t) => String(t.id) === msgIdStr);
+        if (existing) {
+          if (!existing.sizeBytes && doc.size) existing.sizeBytes = Number(doc.size);
+          newIndex.push(existing);
+        } else {
+          const parsed = await parseTrackMessage(msg);
+          if (parsed) newIndex.push(parsed);
+        }
+
+        if (audioCandidates % 100 === 0) {
+          console.log(`[Library] Indexed ${audioCandidates} audio files so far...`);
+        }
+      }
     }
 
     trackIndex = newIndex;
     updateMediaCacheCapacity();
     lastIndexed = Date.now();
     saveCache();
+
+    console.log(`[Library] History scan: ${scanned} matching messages, ${audioCandidates} audio candidates.`);
     console.log(`[Library] Channel indexing complete: ${trackIndex.length} tracks loaded.`);
     await deduplicateEntireLibrary();
   } catch (err) {
