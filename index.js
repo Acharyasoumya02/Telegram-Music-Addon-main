@@ -48,6 +48,8 @@ try {
 const PORT = process.env.PORT || 3000;
 const URL_SECRET = cleanEnv(process.env.URL_SECRET || process.env.ACCESS_TOKEN);
 const CACHE_FILE = path.join(__dirname, 'tracks_cache.json');
+const INDEX_STATE_FILE = path.join(__dirname, 'index_state.json');
+const INDEX_CHECKPOINT_COUNT = 3;
 
 // GramJS StringSession requires the session string to begin with the version character "1"
 if (SESSION_STRING && SESSION_STRING[0] !== '1') {
@@ -236,6 +238,52 @@ function saveCache() {
   } catch (err) {
     console.warn(`Could not save cache: ${err.message}`);
   }
+}
+
+let indexState = {
+  initialScanComplete: false,
+  recentAudioMessageIds: [],
+};
+
+function loadIndexState() {
+  try {
+    if (!fs.existsSync(INDEX_STATE_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(INDEX_STATE_FILE, 'utf-8'));
+    if (!data || typeof data !== 'object') return;
+    indexState.initialScanComplete = data.initialScanComplete === true;
+    if (Array.isArray(data.recentAudioMessageIds)) {
+      indexState.recentAudioMessageIds = data.recentAudioMessageIds
+        .map((id) => String(id))
+        .filter((id) => /^\d+$/.test(id))
+        .slice(0, INDEX_CHECKPOINT_COUNT);
+    }
+    console.log(`[IndexState] Loaded checkpoint: complete=${indexState.initialScanComplete}, overlap IDs=${indexState.recentAudioMessageIds.join(', ') || 'none'}`);
+  } catch (err) {
+    console.warn(`[IndexState] Could not load checkpoint: ${err.message}`);
+  }
+}
+
+function saveIndexState() {
+  try {
+    fs.writeFileSync(INDEX_STATE_FILE, JSON.stringify(indexState, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn(`[IndexState] Could not save checkpoint: ${err.message}`);
+  }
+}
+
+function rememberAudioMessageId(id) {
+  const idStr = String(id);
+  if (!/^\d+$/.test(idStr)) return;
+  const ids = [idStr, ...indexState.recentAudioMessageIds.filter((x) => x !== idStr)];
+  ids.sort((a, b) => Number(b) - Number(a));
+  indexState.recentAudioMessageIds = ids.slice(0, INDEX_CHECKPOINT_COUNT);
+}
+
+function getIncrementalMinId() {
+  const ids = indexState.recentAudioMessageIds
+    .map((id) => Number(id))
+    .filter((id) => Number.isSafeInteger(id) && id > 0);
+  return ids.length ? Math.min(...ids) : 0;
 }
 
 function isFileReferenceError(err) {
@@ -1222,32 +1270,45 @@ async function deduplicateEntireLibrary() {
 
 let isIndexing = false;
 
-async function buildTrackIndex() {
+async function buildTrackIndex({ forceFull = false } = {}) {
   if (isIndexing) return;
   isIndexing = true;
   fastStartCache.clear();
 
   try {
-    const newIndex = [];
+    const isIncremental =
+      !forceFull &&
+      indexState.initialScanComplete &&
+      trackIndex.length > 0 &&
+      getIncrementalMinId() > 0;
+
+    const scanMinId = isIncremental ? getIncrementalMinId() : 0;
     const seenIds = new Set();
     const existingById = new Map(trackIndex.map((t) => [String(t.id), t]));
+    const newlyParsed = [];
     let scanned = 0;
     let audioCandidates = 0;
+    const scanCheckpointIds = [...indexState.recentAudioMessageIds];
 
-    // FLAC/hi-res uploads are commonly Telegram "documents", not Telegram
-    // "music" messages. Scan BOTH filters so the full personal library is found.
+    if (isIncremental) {
+      console.log(`[Library] Incremental scan active. Checking audio messages newer than checkpoint window (min ID: ${scanMinId}).`);
+    } else {
+      console.log('[Library] Full history scan active. This is required when no completed checkpoint exists.');
+    }
+
     const filters = [
       { name: 'music', filter: Api.InputMessagesFilterMusic },
       { name: 'documents', filter: Api.InputMessagesFilterDocument },
     ];
 
     for (const filterInfo of filters) {
-      console.log(`[Library] Scanning Telegram ${filterInfo.name} history...`);
+      console.log(`[Library] Scanning Telegram ${filterInfo.name} ${isIncremental ? 'incremental' : 'history'}...`);
 
       for await (const msg of client.iterMessages(channelEntity, {
         limit: 0,
         waitTime: 1,
         filter: filterInfo.filter,
+        ...(isIncremental ? { minId: scanMinId } : {}),
       })) {
         scanned++;
 
@@ -1259,33 +1320,63 @@ async function buildTrackIndex() {
         if (!doc || !isAudioDocument(doc)) continue;
 
         audioCandidates++;
+        rememberAudioMessageId(msg.id);
+        scanCheckpointIds.push(msgIdStr);
+
         const existing = existingById.get(msgIdStr);
         if (existing) {
           if (!existing.sizeBytes && doc.size) {
             existing.sizeBytes = Number(doc.size);
           }
-          newIndex.push(existing);
         } else {
           const parsed = await parseTrackMessage(msg, false);
           if (parsed) {
-            newIndex.push(parsed);
+            newlyParsed.push(parsed);
             existingById.set(msgIdStr, parsed);
           }
         }
 
         if (audioCandidates % 100 === 0) {
-          console.log(`[Library] Indexed ${audioCandidates} audio files so far...`);
+          console.log(`[Library] ${isIncremental ? 'Checked' : 'Indexed'} ${audioCandidates} audio files so far...`);
         }
       }
     }
 
-    trackIndex = newIndex;
-    updateMediaCacheCapacity();
-    lastIndexed = Date.now();
-    saveCache();
+    if (isIncremental) {
+      for (const parsed of newlyParsed.sort((a, b) => Number(b.id) - Number(a.id))) {
+        await processTrackUpload(parsed);
+      }
 
-    console.log(`[Library] History scan complete: ${scanned} matching messages, ${audioCandidates} audio candidates, ${trackIndex.length} tracks indexed.`);
-    await deduplicateEntireLibrary();
+      updateMediaCacheCapacity();
+      lastIndexed = Date.now();
+      saveCache();
+
+      indexState.recentAudioMessageIds = [...new Set(scanCheckpointIds.map(String))]
+        .sort((a, b) => Number(b) - Number(a))
+        .slice(0, INDEX_CHECKPOINT_COUNT);
+      saveIndexState();
+
+      console.log(`[Library] Incremental scan complete: ${scanned} messages checked, ${audioCandidates} audio candidates, ${newlyParsed.length} new tracks processed, ${trackIndex.length} tracks in library.`);
+    } else {
+      for (const parsed of newlyParsed) {
+        trackIndex.push(parsed);
+      }
+
+      updateMediaCacheCapacity();
+      lastIndexed = Date.now();
+      saveCache();
+
+      console.log(`[Library] History scan complete: ${scanned} matching messages, ${audioCandidates} audio candidates, ${trackIndex.length} tracks indexed.`);
+      await deduplicateEntireLibrary();
+
+      indexState.initialScanComplete = true;
+      indexState.recentAudioMessageIds = [...new Set(scanCheckpointIds.map(String))]
+        .sort((a, b) => Number(b) - Number(a))
+        .slice(0, INDEX_CHECKPOINT_COUNT);
+      saveIndexState();
+
+      console.log(`[IndexState] Initial checkpoint saved. Future restarts will check only after the last ${INDEX_CHECKPOINT_COUNT} audio message IDs.`);
+    }
   } catch (err) {
     console.error('[Library] Error during track indexing:', err.stack || err.message);
   } finally {
@@ -2169,8 +2260,9 @@ app.get('/audio/:id', async (req, res) => {
 // Manual refresh endpoint
 app.get('/refresh', async (req, res) => {
   try {
-    await buildTrackIndex();
-    res.json({ ok: true, count: trackIndex.length });
+    const forceFull = String(req.query.full || '') === '1';
+    await buildTrackIndex({ forceFull });
+    res.json({ ok: true, count: trackIndex.length, mode: forceFull ? 'full' : 'incremental' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2359,6 +2451,7 @@ async function startBotCallbackPoller(botToken) {
 (async () => {
   try {
     loadCache();
+    loadIndexState();
     loadNotificationState();
     console.log('Connecting to Telegram MTProto...');
     await client.connect();
