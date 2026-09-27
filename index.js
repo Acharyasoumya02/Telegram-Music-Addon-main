@@ -181,13 +181,13 @@ class SimpleLRU {
   }
 }
 
-const mediaCache = new SimpleLRU(10000);
+const MEDIA_CACHE_MAX = 200;
+const mediaCache = new SimpleLRU(MEDIA_CACHE_MAX);
 
 function updateMediaCacheCapacity() {
-  const dynamicCap = Math.max(10000, Math.ceil(trackIndex.length * 1.5));
-  if (mediaCache.maxSize !== dynamicCap) {
-    mediaCache.maxSize = dynamicCap;
-  }
+  // Keep Telegram media objects bounded regardless of library size.
+  // Track metadata is kept separately; media is fetched on demand when played.
+  if (mediaCache.maxSize !== MEDIA_CACHE_MAX) mediaCache.maxSize = MEDIA_CACHE_MAX;
 }
 const fastStartCache = new SimpleLRU(10);
 const FAST_START_BYTES = 512 * 1024;
@@ -1259,8 +1259,6 @@ async function buildTrackIndex() {
         if (!doc || !isAudioDocument(doc)) continue;
 
         audioCandidates++;
-        mediaCache.set(msgIdStr, msg.media);
-
         const existing = existingById.get(msgIdStr);
         if (existing) {
           if (!existing.sizeBytes && doc.size) {
@@ -1268,7 +1266,7 @@ async function buildTrackIndex() {
           }
           newIndex.push(existing);
         } else {
-          const parsed = await parseTrackMessage(msg);
+          const parsed = await parseTrackMessage(msg, false);
           if (parsed) {
             newIndex.push(parsed);
             existingById.set(msgIdStr, parsed);
